@@ -1,4 +1,5 @@
 """Snapshot OHLCV from broker for a fixed pair set and write to data/*.jsonl.
+# trigger v1
 
 Runs inside a GitHub Actions job. Reads BROKER_SSID from env, connects once,
 pulls M1 and M5 candles per pair, writes one JSON snapshot per (pair, interval)
