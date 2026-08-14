@@ -1,12 +1,8 @@
 """Snapshot OHLCV from broker for a fixed pair set and write to data/*.jsonl.
-# trigger v1
 
 Runs inside a GitHub Actions job. Reads BROKER_SSID from env, connects once,
 pulls M1 and M5 candles per pair, writes one JSON snapshot per (pair, interval)
 into data/<PAIR>_<INTERVAL>.jsonl (overwrite — always latest N bars).
-
-Contract kept intentionally narrow: consumer downloads raw file via HTTPS and
-parses it. No auth on read side (public repo).
 """
 from __future__ import annotations
 
@@ -23,8 +19,6 @@ from loguru import logger
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from po_client.client import AsyncPocketOptionClient  # noqa: E402
 
-# ── pair set — MUST match services/signal_engine/config.py in the private repo.
-# 11 forex OTC pairs the engine actually trades. Keep identical order & names.
 PAIRS: list[tuple[str, str]] = [
     ("EUR/USD", "EURUSD"),
     ("GBP/USD", "GBPUSD"),
@@ -40,28 +34,26 @@ PAIRS: list[tuple[str, str]] = [
 ]
 
 INTERVALS: list[tuple[str, int, int]] = [
-    # (label, period_seconds, bars) — matches engine.cfg (M1×100 + M5×60)
-    ("1min", 60, 120),   # +20 buffer over engine's fetch_bars=100
-    ("5min", 300, 80),   # +20 buffer over engine's mtf_bars=60
+    ("1min", 60, 120),
+    ("5min", 300, 80),
 ]
 
 DATA_DIR = Path(__file__).resolve().parent / "data"
 DATA_DIR.mkdir(exist_ok=True)
 
-CONNECT_TIMEOUT_S = 20.0
-FETCH_TIMEOUT_S = 25.0
+CONNECT_TIMEOUT_S = 25.0
+FETCH_TIMEOUT_S = 40.0
+POST_SUBSCRIBE_WAIT_S = 4.0
+INTER_FETCH_SLEEP_S = 0.4
 
 
 def _to_asset(alias: str) -> str:
-    """EURUSD -> EURUSD_otc (OTC-only, matches po_fetcher._to_asset contract)."""
     return f"{alias}_otc"
 
 
 def _bars_to_records(candles) -> list[dict]:
-    """Normalize whatever chipa returns into [{ts, open, high, low, close}, ...]."""
     out: list[dict] = []
     for c in candles or []:
-        # chipa Candle model: .time (datetime), .open, .high, .low, .close
         ts = getattr(c, "time", None) or getattr(c, "timestamp", None)
         if ts is None:
             continue
@@ -80,6 +72,28 @@ def _bars_to_records(candles) -> list[dict]:
         except (AttributeError, TypeError, ValueError) as e:
             logger.warning(f"skip malformed candle: {e}")
     return out
+
+
+async def _subscribe_all(client, assets: list[str]) -> int:
+    """Send changeSymbol subscribe for every asset+period we plan to fetch.
+
+    Chipa `get_candles` calls `loadHistoryPeriod` which PO silently drops
+    unless the asset has an active session. Explicit `changeSymbol` opens
+    that session first — mirrors what our production po_fetcher.subscribe_live
+    does on VPS startup.
+    """
+    sent = 0
+    for asset in assets:
+        for _label, period_s, _bars in INTERVALS:
+            msg = f'42{json.dumps(["changeSymbol", {"asset": asset, "period": period_s}])}'
+            try:
+                ok = await client.send_message(msg)
+                if ok:
+                    sent += 1
+            except Exception as e:
+                logger.warning(f"subscribe failed {asset} p={period_s}: {e}")
+    logger.info(f"subscribed: {sent}/{len(assets) * len(INTERVALS)} (asset, period) tuples")
+    return sent
 
 
 async def _fetch_one(client, asset: str, period: int, bars: int) -> list[dict]:
@@ -115,7 +129,13 @@ async def main() -> int:
         logger.error("connect returned False")
         return 4
 
-    logger.info(f"connected in {time.monotonic() - started:.1f}s")
+    logger.info(f"connected in {time.monotonic() - started:.1f}s (uid={getattr(client, 'uid', '?')})")
+
+    assets = [_to_asset(alias) for _display, alias in PAIRS]
+    await _subscribe_all(client, assets)
+
+    logger.info(f"waiting {POST_SUBSCRIBE_WAIT_S}s for PO to open asset sessions...")
+    await asyncio.sleep(POST_SUBSCRIBE_WAIT_S)
 
     written = 0
     failed = 0
@@ -125,6 +145,7 @@ async def main() -> int:
             records = await _fetch_one(client, asset, period_s, bars)
             if not records:
                 failed += 1
+                await asyncio.sleep(INTER_FETCH_SLEEP_S)
                 continue
             snapshot = {
                 "asset": alias,
@@ -135,6 +156,8 @@ async def main() -> int:
             out_path = DATA_DIR / f"{alias}_{label}.jsonl"
             out_path.write_text(json.dumps(snapshot, separators=(",", ":")), encoding="utf-8")
             written += 1
+            logger.info(f"wrote {alias}_{label}: {len(records)} bars")
+            await asyncio.sleep(INTER_FETCH_SLEEP_S)
 
     try:
         await asyncio.wait_for(client.disconnect(), timeout=5.0)
