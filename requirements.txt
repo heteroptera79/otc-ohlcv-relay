@@ -1,0 +1,4 @@
+websockets==13.1
+pydantic==2.9.2
+loguru==0.7.2
+pandas==2.2.3

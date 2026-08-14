@@ -1,0 +1,47 @@
+name: fetch-otc
+on:
+  schedule:
+    - cron: '*/10 * * * *'
+  push:
+    branches: [master]
+    paths:
+      - '.github/workflows/fetch.yml'
+      - 'fetch.py'
+      - 'po_client/**'
+      - 'requirements.txt'
+  workflow_dispatch:
+
+concurrency:
+  group: fetch-otc
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 4
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+      - name: install deps
+        run: pip install -r requirements.txt
+      - name: fetch snapshots
+        env:
+          PO_SSID: ${{ secrets.PO_SSID }}
+        run: python fetch.py
+      - name: commit and push
+        run: |
+          if [ -z "$(git status --porcelain data/)" ]; then
+            echo "no data changes"
+            exit 0
+          fi
+          git config user.email "runner@ci"
+          git config user.name "relay-runner"
+          git add data/
+          git commit -m "snapshot $(date -u +%FT%TZ)"
+          git push
