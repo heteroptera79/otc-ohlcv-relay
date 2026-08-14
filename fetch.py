@@ -48,6 +48,7 @@ DATA_DIR.mkdir(exist_ok=True)
 CONNECT_TIMEOUT_S = 25.0
 CAPTURE_DURATION_S = 240.0  # 4 minutes live capture per run
 ROLLING_WINDOW_BARS = 200   # ~3.3h of M1 — covers M5×60 aggregation
+WS_DUMP_MAX_MESSAGES = 200  # cap raw dump to keep run.log manageable
 
 
 def _to_asset(alias: str) -> str:
@@ -210,6 +211,28 @@ async def main() -> int:
         client.add_event_callback("stream_update", _on_stream_update)
     except Exception as e:
         logger.error(f"failed to wire stream handler: {e}")
+
+    # Diagnostic dump — hook every non-payout event so we see what PO actually
+    # sends. Keeps a bounded count of representative samples per event name.
+    _seen_events: dict[str, int] = {}
+    _EVENT_SAMPLE_CAP = 5
+
+    async def _dump_event(name: str, data):  # noqa: ANN001
+        cnt = _seen_events.get(name, 0)
+        if cnt < _EVENT_SAMPLE_CAP:
+            _seen_events[name] = cnt + 1
+            snippet = str(data)[:400]
+            logger.info(f"DUMP {name} #{cnt + 1}: {snippet}")
+
+    for ev in [
+        "authenticated", "connected", "balance_updated",
+        "candles_received", "json_data", "order_data",
+        "balance_data", "cached_message", "disconnected",
+    ]:
+        try:
+            client.add_event_callback(ev, lambda d, _n=ev: asyncio.create_task(_dump_event(_n, d)))
+        except Exception as e:
+            logger.warning(f"dump-hook {ev} failed: {e}")
 
     assets = [_to_asset(alias) for _display, alias in PAIRS]
     await _subscribe_all(client, assets)
