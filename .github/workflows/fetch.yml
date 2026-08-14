@@ -46,7 +46,8 @@ jobs:
           set +e
           mkdir -p data
           echo "committed_at=$(date -u +%FT%TZ)" >> run.log
-          tail -c 20000 run.log > run.log.trimmed && mv run.log.trimmed run.log
+          # keep full log for now — need first-N lines to diagnose region/subscribe
+          tail -c 200000 run.log > run.log.trimmed && mv run.log.trimmed run.log
           git config user.email "runner@ci"
           git config user.name "relay-runner"
           git add -f run.log data/
