@@ -1,9 +1,4 @@
-"""Snapshot OHLCV from broker for a fixed pair set and write to data/*.jsonl.
-
-Runs inside a GitHub Actions job. Reads BROKER_SSID from env, connects once,
-pulls M1 and M5 candles per pair, writes one JSON snapshot per (pair, interval)
-into data/<PAIR>_<INTERVAL>.jsonl (overwrite — always latest N bars).
-"""
+"""Snapshot OHLCV from broker for a fixed pair set and write to data/*.jsonl."""
 from __future__ import annotations
 
 import asyncio
@@ -41,10 +36,12 @@ INTERVALS: list[tuple[str, int, int]] = [
 DATA_DIR = Path(__file__).resolve().parent / "data"
 DATA_DIR.mkdir(exist_ok=True)
 
-CONNECT_TIMEOUT_S = 25.0
-FETCH_TIMEOUT_S = 40.0
-POST_SUBSCRIBE_WAIT_S = 4.0
-INTER_FETCH_SLEEP_S = 0.4
+CONNECT_TIMEOUT_S = 20.0
+FETCH_TIMEOUT_S = 15.0
+POST_SUBSCRIBE_WAIT_S = 3.0
+INTER_FETCH_SLEEP_S = 0.2
+TOTAL_FETCH_BUDGET_S = 180.0
+MAX_CONSECUTIVE_TIMEOUTS = 4
 
 
 def _to_asset(alias: str) -> str:
@@ -75,13 +72,6 @@ def _bars_to_records(candles) -> list[dict]:
 
 
 async def _subscribe_all(client, assets: list[str]) -> int:
-    """Send changeSymbol subscribe for every asset+period we plan to fetch.
-
-    Chipa `get_candles` calls `loadHistoryPeriod` which PO silently drops
-    unless the asset has an active session. Explicit `changeSymbol` opens
-    that session first — mirrors what our production po_fetcher.subscribe_live
-    does on VPS startup.
-    """
     sent = 0
     for asset in assets:
         for _label, period_s, _bars in INTERVALS:
@@ -92,23 +82,23 @@ async def _subscribe_all(client, assets: list[str]) -> int:
                     sent += 1
             except Exception as e:
                 logger.warning(f"subscribe failed {asset} p={period_s}: {e}")
-    logger.info(f"subscribed: {sent}/{len(assets) * len(INTERVALS)} (asset, period) tuples")
+    logger.info(f"subscribed: {sent}/{len(assets) * len(INTERVALS)} tuples")
     return sent
 
 
-async def _fetch_one(client, asset: str, period: int, bars: int) -> list[dict]:
+async def _fetch_one(client, asset: str, period: int, bars: int) -> tuple[list[dict], float]:
+    t0 = time.monotonic()
     try:
         result = await asyncio.wait_for(
             client.get_candles(asset, timeframe=period, count=bars),
             timeout=FETCH_TIMEOUT_S,
         )
-        return _bars_to_records(result)
+        return _bars_to_records(result), time.monotonic() - t0
     except asyncio.TimeoutError:
-        logger.warning(f"fetch timeout: {asset} p={period} bars={bars}")
-        return []
+        return [], time.monotonic() - t0
     except Exception as e:
-        logger.warning(f"fetch failed: {asset} p={period}: {e}")
-        return []
+        logger.warning(f"fetch error: {asset} p={period}: {e}")
+        return [], time.monotonic() - t0
 
 
 async def main() -> int:
@@ -137,16 +127,34 @@ async def main() -> int:
     logger.info(f"waiting {POST_SUBSCRIBE_WAIT_S}s for PO to open asset sessions...")
     await asyncio.sleep(POST_SUBSCRIBE_WAIT_S)
 
+    fetch_started = time.monotonic()
     written = 0
     failed = 0
+    consecutive_timeouts = 0
+    aborted = False
+
     for _display, alias in PAIRS:
+        if aborted:
+            break
         asset = _to_asset(alias)
         for label, period_s, bars in INTERVALS:
-            records = await _fetch_one(client, asset, period_s, bars)
+            elapsed_fetch = time.monotonic() - fetch_started
+            if elapsed_fetch > TOTAL_FETCH_BUDGET_S:
+                logger.warning(f"total fetch budget {TOTAL_FETCH_BUDGET_S}s exceeded — stopping")
+                aborted = True
+                break
+            records, took = await _fetch_one(client, asset, period_s, bars)
             if not records:
                 failed += 1
+                consecutive_timeouts += 1
+                logger.warning(f"empty: {alias}_{label} took={took:.1f}s (streak={consecutive_timeouts})")
+                if consecutive_timeouts >= MAX_CONSECUTIVE_TIMEOUTS:
+                    logger.error(f"{MAX_CONSECUTIVE_TIMEOUTS} consecutive empty — aborting cycle")
+                    aborted = True
+                    break
                 await asyncio.sleep(INTER_FETCH_SLEEP_S)
                 continue
+            consecutive_timeouts = 0
             snapshot = {
                 "asset": alias,
                 "interval": label,
@@ -156,7 +164,7 @@ async def main() -> int:
             out_path = DATA_DIR / f"{alias}_{label}.jsonl"
             out_path.write_text(json.dumps(snapshot, separators=(",", ":")), encoding="utf-8")
             written += 1
-            logger.info(f"wrote {alias}_{label}: {len(records)} bars")
+            logger.info(f"wrote {alias}_{label}: {len(records)} bars took={took:.1f}s")
             await asyncio.sleep(INTER_FETCH_SLEEP_S)
 
     try:
@@ -165,7 +173,7 @@ async def main() -> int:
         pass
 
     elapsed = time.monotonic() - started
-    logger.info(f"done in {elapsed:.1f}s | written={written} failed={failed}")
+    logger.info(f"done in {elapsed:.1f}s | written={written} failed={failed} aborted={aborted}")
     return 0 if written else 5
 
 
