@@ -29,19 +29,37 @@ jobs:
           python-version: '3.11'
           cache: 'pip'
       - name: install deps
-        run: pip install -r requirements.txt
+        run: pip install -r requirements.txt |& tee -a run.log
       - name: fetch snapshots
         env:
           PO_SSID: ${{ secrets.PO_SSID }}
-        run: python fetch.py
-      - name: commit and push
         run: |
-          if [ -z "$(git status --porcelain data/)" ]; then
-            echo "no data changes"
-            exit 0
-          fi
+          set +e
+          python fetch.py |& tee -a run.log
+          EC=$?
+          echo "python_exit=$EC" >> run.log
+          echo "finished_at=$(date -u +%FT%TZ)" >> run.log
+          exit 0
+      - name: commit log and data (always)
+        if: always()
+        run: |
+          set +e
+          mkdir -p data
+          echo "committed_at=$(date -u +%FT%TZ)" >> run.log
+          tail -c 20000 run.log > run.log.trimmed && mv run.log.trimmed run.log
           git config user.email "runner@ci"
           git config user.name "relay-runner"
-          git add data/
-          git commit -m "snapshot $(date -u +%FT%TZ)"
-          git push
+          git add -f run.log data/
+          if git diff --cached --quiet; then
+            echo "nothing to commit"
+            exit 0
+          fi
+          git commit -m "run $(date -u +%FT%TZ)"
+          # push may race with parallel runs; retry once after rebase
+          for i in 1 2 3; do
+            if git push; then
+              exit 0
+            fi
+            git pull --rebase --autostash
+          done
+          exit 1
